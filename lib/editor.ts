@@ -3,6 +3,7 @@ import type {
   AnnotationKind,
   ConflictGroup,
   EditorState,
+  PendingImportBatch,
   SearchResult,
   Sentence,
   TextDocument,
@@ -10,6 +11,7 @@ import type {
 } from './types';
 
 export const STORAGE_KEY = 'sologsb-1022/public-text-annotator/v1';
+export const IMPORT_QUEUE_STORAGE_KEY = 'sologsb-1022/pending-imports/v1';
 
 export function clone<T>(value: T): T {
   return structuredClone(value);
@@ -218,7 +220,8 @@ function findChapterIdForAnnotation(document: TextDocument, annotation: Annotati
 export function getConflictGroups(document: TextDocument): ConflictGroup[] {
   const groups = new Map<string, Annotation[]>();
   for (const annotation of document.annotations) {
-    if (annotation.conflictState === 'resolved') continue;
+    // 已解决的校记与正文修订后失效待复核的批注都不参与冲突重算
+    if (annotation.conflictState === 'resolved' || annotation.stale) continue;
     const key = `${annotation.anchorId}:${annotation.kind}`;
     groups.set(key, [...(groups.get(key) ?? []), annotation]);
   }
@@ -269,25 +272,56 @@ export function updateSentenceText(
   tokenize: (value: string, id: string, existing: Sentence['tokens']) => Sentence['tokens']
 ) {
   let remappedAnnotations = 0;
+  let invalidatedAnnotations = 0;
   for (const chapter of document.chapters) {
     const sentence = chapter.sentences.find((item) => item.id === sentenceId);
     if (!sentence) continue;
+    const previousText = sentence.text;
     const previousIds = new Set(sentence.tokens.map((token) => token.id));
     sentence.text = text;
     sentence.tokens = tokenize(text, sentence.id, sentence.tokens);
     const remainingIds = new Set(sentence.tokens.map((token) => token.id));
+    const tokenIds = sentence.tokens.map((token) => token.id);
+    const textChanged = previousText !== text;
 
     for (const annotation of document.annotations) {
-      if (annotation.anchorType === 'word' && previousIds.has(annotation.anchorId) && !remainingIds.has(annotation.anchorId)) {
+      const anchorsSentence = annotation.anchorId === sentence.id;
+      const anchorsWord = annotation.anchorType === 'word' && previousIds.has(annotation.anchorId);
+      if (!anchorsSentence && !anchorsWord) continue;
+
+      if (anchorsWord && !remainingIds.has(annotation.anchorId)) {
         annotation.anchorId = sentence.id;
         annotation.anchorType = 'sentence';
         annotation.title = `${annotation.title}（引用已随修订迁移）`;
         remappedAnnotations += 1;
       }
+
+      // 句子正文改动后，相关批注立即失效，等待复核重算
+      if (textChanged && !annotation.stale) {
+        annotation.stale = true;
+        invalidatedAnnotations += 1;
+      }
     }
     break;
   }
-  return remappedAnnotations;
+  return { remappedAnnotations, invalidatedAnnotations };
+}
+
+/** 复核通过：清除指定锚点上的失效标记，冲突状态随即重算。 */
+export function revalidateAnnotations(
+  document: TextDocument,
+  sentenceId: string,
+  tokenIds: readonly string[]
+) {
+  let count = 0;
+  const scope = new Set<string>([sentenceId, ...tokenIds]);
+  for (const annotation of document.annotations) {
+    if (annotation.stale && scope.has(annotation.anchorId)) {
+      annotation.stale = false;
+      count += 1;
+    }
+  }
+  return count;
 }
 
 export function removeAnnotationReferences(document: TextDocument, removedId: string) {
@@ -308,4 +342,32 @@ export function toWorkspace(document: TextDocument, fallback: WorkspaceState): W
     query: fallback.query,
     dirty: false
   };
+}
+
+/** 兼容旧版离线草稿：补齐导入登记表与失效标记字段。 */
+export function migrateWorkspace(workspace: WorkspaceState): WorkspaceState {
+  workspace.document.importedPackages ??= [];
+  for (const annotation of workspace.document.annotations) {
+    annotation.stale ??= false;
+  }
+  return workspace;
+}
+
+export function loadPendingImportBatches(): PendingImportBatch[] {
+  try {
+    const raw = localStorage.getItem(IMPORT_QUEUE_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as PendingImportBatch[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+export function savePendingImportBatches(batches: PendingImportBatch[]) {
+  if (batches.length) {
+    localStorage.setItem(IMPORT_QUEUE_STORAGE_KEY, JSON.stringify(batches));
+  } else {
+    localStorage.removeItem(IMPORT_QUEUE_STORAGE_KEY);
+  }
 }

@@ -36,7 +36,44 @@ export interface Annotation {
   tags: string[];
   conflictState: 'open' | 'resolved';
   conflictResolution?: string;
+  /** 正文修订后相关批注立即失效，等待人工复核 */
+  stale?: boolean;
+  /** 导入自哪个离线批注包 */
+  importedFrom?: string;
   updatedAt: string;
+}
+
+export type PackageAnnotationKind = AnnotationKind;
+export type PackageAnchorType = AnchorType;
+
+export interface PackageAnnotation {
+  id?: string;
+  anchorId: string;
+  anchorType: PackageAnchorType;
+  kind: PackageAnnotationKind;
+  title: string;
+  body: string;
+  source: string;
+  references?: string[];
+  tags?: string[];
+}
+
+export interface AnnotationPackage {
+  packageId: string;
+  label: string;
+  source: string;
+  exportedAt?: string;
+  annotations: PackageAnnotation[];
+}
+
+export interface ImportedPackageRecord {
+  packageId: string;
+  label: string;
+  source: string;
+  importedAt: string;
+  added: number;
+  keptLocalResolved: number;
+  skipped: number;
 }
 
 export interface VersionSnapshot {
@@ -56,7 +93,47 @@ export interface TextDocument {
   chapters: Chapter[];
   annotations: Annotation[];
   snapshots: VersionSnapshot[];
+  /** 已成功合并的离线包登记，同一包重复导入直接去重 */
+  importedPackages?: ImportedPackageRecord[];
   updatedAt: string;
+}
+
+export type ImportDecision =
+  | 'identical'
+  | 'new'
+  | 'bothChanged'
+  | 'localResolvedKept'
+  | 'staleTarget'
+  | 'skipped';
+
+export interface ImportPlanItem {
+  decision: ImportDecision;
+  reason: string;
+  incoming: PackageAnnotation;
+  effectiveAnchorId: string;
+  effectiveAnchorType: AnchorType;
+  matchedLocal?: Annotation;
+}
+
+export interface ImportReport {
+  packageId: string;
+  label: string;
+  source: string;
+  importedAt: string;
+  added: ImportPlanItem[];
+  identical: ImportPlanItem[];
+  keptLocalResolved: ImportPlanItem[];
+  skipped: ImportPlanItem[];
+}
+
+export interface PendingImportBatch {
+  batchId: string;
+  packageId: string;
+  label: string;
+  source: string;
+  raw: string;
+  reason: string;
+  failedAt: string;
 }
 
 export interface WorkspaceState {

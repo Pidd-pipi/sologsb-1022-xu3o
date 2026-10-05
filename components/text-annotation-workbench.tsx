@@ -25,6 +25,7 @@ import {
   CircleHelp,
   FileDown,
   FileJson,
+  FolderInput,
   GitCompareArrows,
   Keyboard,
   Link2,
@@ -33,15 +34,17 @@ import {
   Plus,
   Printer,
   Redo2,
+  RotateCcw,
   Save,
   Search,
+  ShieldCheck,
   Trash2,
   Undo2,
   Wifi,
   WifiOff
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { annotationKindLabels, anchorTypeLabels, initialDocument, tokenizeText } from '@/lib/data';
+import { annotationKindLabels, anchorTypeLabels, initialDocument, samplePackages, tokenizeText } from '@/lib/data';
 import {
   STORAGE_KEY,
   clone,
@@ -52,14 +55,31 @@ import {
   getSentence,
   getTargetLabel,
   kindLabel,
+  loadPendingImportBatches,
+  migrateWorkspace,
   removeAnnotationReferences,
+  revalidateAnnotations,
+  savePendingImportBatches,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  PackageParseError,
+  applyImportPlan,
+  buildImportPlan,
+  importDecisionLabels,
+  isPackageImported,
+  parseAnnotationPackage,
+  summarizePlan
+} from '@/lib/imports';
 import type {
   Annotation,
   AnnotationKind,
+  AnnotationPackage,
   AnchorType,
   ConflictGroup,
+  ImportPlanItem,
+  ImportReport,
+  PendingImportBatch,
   Sentence,
   TextDocument,
   ViewMode,
@@ -117,16 +137,31 @@ function buildHtml(document: TextDocument) {
     .join('\n');
 
   const notes = document.annotations
-    .map(
-      (annotation) =>
-        `<li><b>${escapeHtml(annotation.title)}</b> <span>${escapeHtml(annotation.source)}</span><br>${escapeHtml(annotation.body)}</li>`
-    )
+    .map((annotation) => {
+      const target =
+        annotation.anchorType === 'chapter'
+          ? document.chapters.find((chapter) => chapter.id === annotation.anchorId)?.title ?? ''
+          : annotation.anchorType === 'sentence'
+            ? (() => {
+                for (const chapter of document.chapters) {
+                  const hit = chapter.sentences.find((sentence) => sentence.id === annotation.anchorId);
+                  if (hit) return `${chapter.title} · 第 ${hit.order} 句`;
+                }
+                return '';
+              })()
+            : '';
+      const staleMark = annotation.stale ? '<em class="stale">〔正文改后待复核〕</em> ' : '';
+      const targetMark = target ? `<small>（${escapeHtml(target)}）</small> ` : '';
+      const resolvedMark =
+        annotation.conflictState === 'resolved' ? '<small>（已按来源结案）</small> ' : '';
+      return `<li><b>${escapeHtml(annotation.title)}</b> <span>${escapeHtml(annotation.source)}</span> ${targetMark}${resolvedMark}<br>${staleMark}${escapeHtml(annotation.body)}</li>`;
+    })
     .join('\n');
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${escapeHtml(document.title)}</title>
-<style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}li{margin:.8em 0}small{color:#777}</style></head>
+<style>body{max-width:780px;margin:48px auto;padding:0 28px;font:17px/1.9 Georgia,"Noto Serif SC",serif;color:#29251f}h1{text-align:center}h2{margin-top:2.4em;border-bottom:1px solid #ddd;padding-bottom:.35em}.summary{color:#6b665d}li{margin:.8em 0}small{color:#777}.stale{color:#b45309;font-style:normal}</style></head>
 <body><h1>${escapeHtml(document.title)}</h1><p style="text-align:center">${escapeHtml(document.author)} · ${escapeHtml(document.edition)}</p>
-${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}</small></p></body></html>`;
+${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间：${new Date().toLocaleString('zh-CN')}${document.importedPackages?.length ? ` · 已合并离线包 ${document.importedPackages.length} 个` : ''}</small></p></body></html>`;
 }
 
 function sentenceAnnotationCount(document: TextDocument, sentence: Sentence) {
@@ -251,9 +286,10 @@ interface AnnotationCardProps {
   onSelect: () => void;
   onUpdate: (patch: Partial<Annotation>) => void;
   onDelete: () => void;
+  onRevalidate: () => void;
 }
 
-function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, onDelete }: AnnotationCardProps) {
+function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, onDelete, onRevalidate }: AnnotationCardProps) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(annotation.title);
   const [body, setBody] = useState(annotation.body);
@@ -278,7 +314,9 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
                 <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">
                   {kindLabel(annotation.kind)}
                 </Chip>
-                {annotation.conflictState === 'open' ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
+                {annotation.stale ? <Chip size="sm" color="warning" variant="solid">正文改后失效</Chip> : null}
+                {annotation.conflictState === 'resolved' ? <Chip size="sm" color="success" variant="bordered">已解决</Chip> : null}
+                {!annotation.stale && annotation.conflictState === 'open' ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
               </div>
               <h4 className="mt-2 font-semibold text-stone-900">{annotation.title}</h4>
             </div>
@@ -313,6 +351,11 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
               <span className="flex items-center gap-1"><Link2 className="h-3 w-3" />引用 {annotation.references.length} 条</span>
             ) : null}
             <span className="ml-auto flex gap-1">
+              {annotation.stale ? (
+                <Button size="sm" color="warning" variant="flat" aria-label="复核通过该批注" onPress={onRevalidate}>
+                  复核通过
+                </Button>
+              ) : null}
               <Button isIconOnly size="sm" variant="light" aria-label="编辑注释" onPress={() => setEditing(true)}>
                 <Pencil className="h-3.5 w-3.5" />
               </Button>
@@ -324,6 +367,31 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
         )}
       </CardBody>
     </Card>
+  );
+}
+
+const decisionChipColor: Record<ImportPlanItem['decision'], 'success' | 'warning' | 'default' | 'primary' | 'danger'> = {
+  new: 'success',
+  bothChanged: 'warning',
+  identical: 'default',
+  localResolvedKept: 'primary',
+  staleTarget: 'danger',
+  skipped: 'danger'
+};
+
+function PlanItemRow({ item }: { item: ImportPlanItem }) {
+  return (
+    <div className="rounded-lg border border-stone-200 bg-stone-50 p-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <Chip size="sm" color={decisionChipColor[item.decision]} variant="flat">
+          {importDecisionLabels[item.decision]}
+        </Chip>
+        <span className="text-[11px] text-stone-500">{kindLabel(item.incoming.kind)} · {item.incoming.source}</span>
+      </div>
+      <p className="mt-1.5 text-xs font-semibold text-stone-800">{item.incoming.title}</p>
+      <p className="mt-1 line-clamp-3 text-[11px] leading-5 text-stone-600">{item.incoming.body}</p>
+      <p className="mt-1 text-[11px] leading-4 text-stone-400">{item.reason}</p>
+    </div>
   );
 }
 
@@ -340,7 +408,15 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [importRaw, setImportRaw] = useState('');
+  const [parsedPackage, setParsedPackage] = useState<AnnotationPackage | null>(null);
+  const [importPlan, setImportPlan] = useState<ImportPlanItem[] | null>(null);
+  const [importError, setImportError] = useState('');
+  const [importReport, setImportReport] = useState<ImportReport | null>(null);
+  const [simulateFailure, setSimulateFailure] = useState(false);
+  const [pendingBatches, setPendingBatches] = useState<PendingImportBatch[]>([]);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const importFileRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
   const document = workspace.document;
@@ -364,13 +440,14 @@ export function TextAnnotationWorkbench() {
       if (raw) {
         const stored = JSON.parse(raw) as WorkspaceState;
         if (stored.document?.chapters?.length) {
-          dispatch({ type: 'hydrate', workspace: stored });
+          dispatch({ type: 'hydrate', workspace: migrateWorkspace(stored) });
           if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
         }
       }
     } catch {
       setApiMessage('离线草稿损坏，已载入模拟数据');
     }
+    setPendingBatches(loadPendingImportBatches());
     setHydrated(true);
     setOnline(navigator.onLine);
   }, []);
@@ -536,15 +613,177 @@ export function TextAnnotationWorkbench() {
   function applySentenceEdit() {
     if (!editingSentenceId || !editingSentenceDraft.trim()) return;
     let remapped = 0;
+    let invalidated = 0;
     dispatch({
       type: 'commit',
-      label: '修订句子并保持引用稳定',
+      label: '修订句子并使相关批注失效',
       mutate: (doc) => {
-        remapped = updateSentenceText(doc, editingSentenceId, editingSentenceDraft.trim(), tokenizeText);
+        const result = updateSentenceText(doc, editingSentenceId, editingSentenceDraft.trim(), tokenizeText);
+        remapped = result.remappedAnnotations;
+        invalidated = result.invalidatedAnnotations;
       }
     });
     setEditingSentenceId(null);
-    if (remapped) setApiMessage(`已修订句子；${remapped} 条词级引用自动迁移到所属句`);
+    const parts = [`已修订句子`];
+    if (invalidated) parts.push(`${invalidated} 条相关批注立即失效，待复核后重算冲突`);
+    if (remapped) parts.push(`${remapped} 条词级引用自动迁移到所属句`);
+    setApiMessage(parts.join('；'));
+  }
+
+  function revalidateSentence(sentenceId: string) {
+    let count = 0;
+    dispatch({
+      type: 'commit',
+      label: '复核通过失效批注并重算冲突',
+      mutate: (doc) => {
+        const sentence = getSentence(doc, sentenceId);
+        count = revalidateAnnotations(doc, sentenceId, sentence?.tokens.map((token) => token.id) ?? []);
+      }
+    });
+    if (count) setApiMessage(`已复核 ${count} 条批注，冲突状态已重算`);
+  }
+
+  function revalidateOne(annotationId: string) {
+    dispatch({
+      type: 'commit',
+      label: '复核通过单条批注',
+      mutate: (doc) => {
+        const annotation = doc.annotations.find((item) => item.id === annotationId);
+        if (annotation) annotation.stale = false;
+      }
+    });
+  }
+
+  const planSummary = useMemo(
+    () => (importPlan ? summarizePlan(importPlan) : null),
+    [importPlan]
+  );
+
+  function enqueueFailedBatch(raw: string, reason: string, meta?: { packageId?: string; label?: string; source?: string }) {
+    const batch: PendingImportBatch = {
+      batchId: `batch-${Date.now().toString(36)}`,
+      packageId: meta?.packageId ?? 'unknown-package',
+      label: meta?.label ?? '无法解析的批注包',
+      source: meta?.source ?? '未知来源',
+      raw,
+      reason,
+      failedAt: new Date().toISOString()
+    };
+    const next = [batch, ...pendingBatches];
+    setPendingBatches(next);
+    savePendingImportBatches(next);
+  }
+
+  function dismissBatch(batchId: string) {
+    const next = pendingBatches.filter((batch) => batch.batchId !== batchId);
+    setPendingBatches(next);
+    savePendingImportBatches(next);
+  }
+
+  function previewImport(rawText: string) {
+    setImportError('');
+    setImportReport(null);
+    if (!rawText.trim()) {
+      setParsedPackage(null);
+      setImportPlan(null);
+      return;
+    }
+    let pkg: AnnotationPackage;
+    try {
+      pkg = parseAnnotationPackage(rawText);
+    } catch (error) {
+      setParsedPackage(null);
+      setImportPlan(null);
+      setImportError(error instanceof PackageParseError ? error.message : '批注包无法解析。');
+      return;
+    }
+    if (isPackageImported(document, pkg.packageId)) {
+      setParsedPackage(pkg);
+      setImportPlan(null);
+      setImportError(`「${pkg.label}」已合并过，同一包重复导入不会新增记录。`);
+      return;
+    }
+    setParsedPackage(pkg);
+    setImportPlan(buildImportPlan(document, pkg));
+  }
+
+  function commitImport(rawText: string, pkg: AnnotationPackage, plan: ImportPlanItem[], failureReason?: string) {
+    if (simulateFailure || failureReason) {
+      const reason = failureReason ?? '模拟接口返回 500，整批已保留，可稍后重试';
+      enqueueFailedBatch(rawText, reason, { packageId: pkg.packageId, label: pkg.label, source: pkg.source });
+      setApiMessage(`导入失败：${reason}`);
+      return;
+    }
+    let report: ImportReport | null = null;
+    dispatch({
+      type: 'commit',
+      label: `合并离线批注包：${pkg.label}`,
+      mutate: (doc) => {
+        report = applyImportPlan(doc, pkg, plan);
+      }
+    });
+    const mergedReport = report as ImportReport | null;
+    if (!mergedReport) return;
+    setImportReport(mergedReport);
+    setImportPlan(null);
+    setImportRaw('');
+    setParsedPackage(null);
+    setRightTab('imports');
+    setApiMessage(`已合并「${pkg.label}」：新增 ${mergedReport.added.length} 条，保留本地已解决 ${mergedReport.keptLocalResolved.length} 条，重复/跳过 ${mergedReport.identical.length + mergedReport.skipped.length} 条`);
+  }
+
+    function confirmImport() {
+    if (!parsedPackage || !importPlan) return;
+    if (isPackageImported(document, parsedPackage.packageId)) {
+      setImportError('该包已导入，未做任何改动。');
+      return;
+    }
+    // 用最新文档状态重算计划，避免预览后文档又变动（如刚合并过该包）
+    const freshPlan = buildImportPlan(document, parsedPackage);
+    commitImport(importRaw, parsedPackage, freshPlan);
+  }
+
+  function retryBatch(batch: PendingImportBatch) {
+    let pkg: AnnotationPackage;
+    try {
+      pkg = parseAnnotationPackage(batch.raw);
+    } catch (error) {
+      const reason = error instanceof PackageParseError ? error.message : '批注包无法解析。';
+      enqueueFailedBatch(batch.raw, reason, { packageId: batch.packageId, label: batch.label, source: batch.source });
+      dismissBatch(batch.batchId);
+      return;
+    }
+    if (isPackageImported(document, pkg.packageId)) {
+      dismissBatch(batch.batchId);
+      setImportError(`「${pkg.label}」已合并过，重复导入不新增记录。`);
+      return;
+    }
+    const plan = buildImportPlan(document, pkg);
+    commitImport(batch.raw, pkg, plan);
+    dismissBatch(batch.batchId);
+  }
+
+  function loadSamplePackage(index: number) {
+    const sample = samplePackages[index];
+    if (!sample) return;
+    const raw = JSON.stringify(sample, null, 2);
+    setImportRaw(raw);
+    setImportReport(null);
+    previewImport(raw);
+  }
+
+  function handleImportFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const raw = String(reader.result ?? '');
+      setImportRaw(raw);
+      setImportReport(null);
+      previewImport(raw);
+    };
+    reader.onerror = () => {
+      enqueueFailedBatch('', `读取文件 ${file.name} 失败`);
+    };
+    reader.readAsText(file);
   }
 
   function saveVersion() {
@@ -862,13 +1101,35 @@ export function TextAnnotationWorkbench() {
                             </p>
                           )}
 
+                          {sentenceAnnotations.some((annotation) => annotation.stale) ? (
+                            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                              <AlertTriangle className="h-4 w-4" />
+                              <span>
+                                正文改动后 {sentenceAnnotations.filter((annotation) => annotation.stale).length} 条批注已失效，
+                                暂不计入冲突；逐条核对后可复核通过并立即重算。
+                              </span>
+                              <Button
+                                size="sm"
+                                color="warning"
+                                variant="flat"
+                                className="ml-auto"
+                                startContent={<ShieldCheck className="h-3.5 w-3.5" />}
+                                onPress={() => revalidateSentence(sentence.id)}
+                              >
+                                本句全部复核通过
+                              </Button>
+                            </div>
+                          ) : null}
+
                           {mode === 'critical' ? (
                             <div className="mt-3 grid gap-2 rounded-xl border border-blue-100 bg-blue-50/50 p-3 sm:grid-cols-2">
                               {sentenceAnnotations.length ? sentenceAnnotations.map((annotation) => (
-                                <div key={annotation.id} className="critical-variant text-xs leading-5">
+                                <div key={annotation.id} className={`critical-variant text-xs leading-5 ${annotation.stale ? 'opacity-60' : ''}`}>
                                   <div className="flex items-center gap-2">
                                     <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">{kindLabel(annotation.kind)}</Chip>
                                     <b>{annotation.source}</b>
+                                    {annotation.stale ? <Chip size="sm" color="warning" variant="solid">失效待复核</Chip> : null}
+                                    {annotation.conflictState === 'resolved' ? <Chip size="sm" color="success" variant="bordered">已解决</Chip> : null}
                                   </div>
                                   <p className="mt-1 text-stone-700">{annotation.body}</p>
                                 </div>
@@ -962,6 +1223,7 @@ export function TextAnnotationWorkbench() {
                           onSelect={() => dispatch({ type: 'selectAnnotation', annotationId: annotation.id })}
                           onUpdate={(patch) => updateAnnotation(annotation.id, patch)}
                           onDelete={() => deleteAnnotation(annotation.id)}
+                          onRevalidate={() => revalidateOne(annotation.id)}
                         />
                       )) : <p className="rounded-lg border border-dashed border-stone-300 p-4 text-center text-xs text-stone-500">尚未添加注释。选择词语可缩小注释范围。</p>}
                     </div>
@@ -1007,6 +1269,165 @@ export function TextAnnotationWorkbench() {
                           <p className="mt-1 text-xs text-green-700">已解决记录仍保留在各注释的来源字段中。</p>
                         </div>
                       ) : null}
+                    </div>
+                  </ScrollShadow>
+                </Tab>
+
+                <Tab key="imports" title={`导入${pendingBatches.length ? ` (${pendingBatches.length})` : ''}`}>
+                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                    <div className="space-y-4 pr-1">
+                      <div className="rounded-xl bg-stone-100 p-3 text-xs leading-5 text-stone-600">
+                        按“锚点 + 注释类型 + 来源”合并离线批注包：内容一致的不新增；两边都改过的按来源并列，本地已解决的取舍保留；整包失败会留存在下方队列，可重试，同一包不会重复入库。
+                      </div>
+
+                      {pendingBatches.length ? (
+                        <Card shadow="none" className="border border-red-200 bg-red-50/60">
+                          <CardBody className="gap-2 p-3">
+                            <div className="flex items-center gap-2 text-sm font-semibold text-red-800">
+                              <AlertTriangle className="h-4 w-4" />
+                              {pendingBatches.length} 个失败批次待重试
+                            </div>
+                            {pendingBatches.map((batch) => (
+                              <div key={batch.batchId} className="rounded-lg border border-red-100 bg-white p-2.5">
+                                <div className="flex items-center justify-between gap-2">
+                                  <b className="text-xs text-stone-800">{batch.label}</b>
+                                  <span className="text-[11px] text-stone-400">
+                                    {new Date(batch.failedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                                  </span>
+                                </div>
+                                <p className="mt-1 text-[11px] leading-4 text-red-700">{batch.reason}</p>
+                                <div className="mt-2 flex gap-2">
+                                  <Button size="sm" color="danger" variant="flat" startContent={<RotateCcw className="h-3.5 w-3.5" />} onPress={() => retryBatch(batch)}>
+                                    整批重试
+                                  </Button>
+                                  <Button size="sm" variant="light" onPress={() => dismissBatch(batch.batchId)}>放弃</Button>
+                                </div>
+                              </div>
+                            ))}
+                          </CardBody>
+                        </Card>
+                      ) : null}
+
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                          <FolderInput className="h-4 w-4" />离线批注包（JSON）
+                        </h3>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {samplePackages.map((sample, index) => (
+                            <Button key={sample.packageId} size="sm" variant="flat" onPress={() => loadSamplePackage(index)}>
+                              载入示例：{sample.label}
+                            </Button>
+                          ))}
+                          <Button size="sm" variant="light" onPress={() => importFileRef.current?.click()}>选择文件…</Button>
+                          <input
+                            ref={importFileRef}
+                            type="file"
+                            accept="application/json,.json"
+                            className="hidden"
+                            aria-label="选择离线批注包文件"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0];
+                              if (file) handleImportFile(file);
+                              event.target.value = '';
+                            }}
+                          />
+                        </div>
+                        <Textarea
+                          className="mt-3"
+                          aria-label="批注包 JSON 内容"
+                          minRows={6}
+                          value={importRaw}
+                          onValueChange={(value) => {
+                            setImportRaw(value);
+                            previewImport(value);
+                          }}
+                          placeholder='{"packageId":"pkg-x","label":"某整理组批次","annotations":[...]}'
+                        />
+                        <label className="mt-2 flex items-center gap-2 text-xs text-stone-600">
+                          <input
+                            type="checkbox"
+                            checked={simulateFailure}
+                            onChange={(event) => setSimulateFailure(event.target.checked)}
+                          />
+                          模拟导入失败（演示整批留存与重试）
+                        </label>
+                        {importError ? (
+                          <p className="mt-2 rounded-lg bg-red-50 p-2 text-xs leading-5 text-red-700">{importError}</p>
+                        ) : null}
+                        {parsedPackage && importPlan ? (
+                          <div className="mt-3 space-y-2">
+                            <div className="flex flex-wrap gap-1.5">
+                              <Chip size="sm" color="success" variant="flat">新增 {planSummary?.new ?? 0}</Chip>
+                              <Chip size="sm" color="warning" variant="flat">两边都改过 {planSummary?.bothChanged ?? 0}</Chip>
+                              <Chip size="sm" color="primary" variant="flat">保留本地已解决 {planSummary?.localResolvedKept ?? 0}</Chip>
+                              <Chip size="sm" variant="flat">一致不新增 {planSummary?.identical ?? 0}</Chip>
+                              <Chip size="sm" color="danger" variant="flat">失效待复核 {planSummary?.staleTarget ?? 0}</Chip>
+                              <Chip size="sm" color="danger" variant="bordered">锚点无效 {planSummary?.skipped ?? 0}</Chip>
+                            </div>
+                            <div className="max-h-72 space-y-2 overflow-y-auto">
+                              {importPlan.map((item, index) => (
+                                <PlanItemRow key={`${item.incoming.anchorId}-${item.incoming.kind}-${index}`} item={item} />
+                              ))}
+                            </div>
+                            <Button
+                              fullWidth
+                              size="sm"
+                              color="primary"
+                              startContent={<FolderInput className="h-4 w-4" />}
+                              onPress={confirmImport}
+                            >
+                              确认合并（{parsedPackage.label} · {parsedPackage.source}）
+                            </Button>
+                          </div>
+                        ) : null}
+                      </div>
+
+                      {importReport ? (
+                        <div className="rounded-xl border border-green-200 bg-green-50/60 p-3">
+                          <div className="flex items-center gap-2 text-sm font-semibold text-green-800">
+                            <Check className="h-4 w-4" />
+                            合并报告：{importReport.label}
+                          </div>
+                          <p className="mt-1 text-[11px] text-green-700">
+                            {new Date(importReport.importedAt).toLocaleString('zh-CN')} · 新增 {importReport.added.length} ·
+                            保留本地已解决 {importReport.keptLocalResolved.length} · 一致 {importReport.identical.length} ·
+                            跳过 {importReport.skipped.length}
+                          </p>
+                          <div className="mt-2 max-h-72 space-y-2 overflow-y-auto">
+                            {[...importReport.added, ...importReport.keptLocalResolved, ...importReport.identical, ...importReport.skipped].map((item, index) => (
+                              <PlanItemRow key={`report-${index}`} item={item} />
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      <Divider />
+                      <div>
+                        <h3 className="flex items-center gap-2 text-sm font-semibold text-stone-900">
+                          <ShieldCheck className="h-4 w-4" />已合并批注包
+                        </h3>
+                        <div className="mt-2 space-y-2">
+                          {(document.importedPackages ?? []).length ? (
+                            (document.importedPackages ?? []).map((record) => (
+                              <div key={record.packageId} className="rounded-lg border border-stone-200 p-2.5 text-xs">
+                                <div className="flex items-center justify-between gap-2">
+                                  <b className="text-stone-800">{record.label}</b>
+                                  <span className="text-stone-400">
+                                    {new Date(record.importedAt).toLocaleDateString('zh-CN')}
+                                  </span>
+                                </div>
+                                <p className="mt-1 text-stone-500">
+                                  {record.source} · 新增 {record.added} · 保留本地已解决 {record.keptLocalResolved} · 重复/跳过 {record.skipped}
+                                </p>
+                              </div>
+                            ))
+                          ) : (
+                            <p className="rounded-lg border border-dashed border-stone-300 p-3 text-center text-xs text-stone-500">
+                              尚未合并任何离线包。
+                            </p>
+                          )}
+                        </div>
+                      </div>
                     </div>
                   </ScrollShadow>
                 </Tab>

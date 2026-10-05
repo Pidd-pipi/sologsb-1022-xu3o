@@ -2,6 +2,7 @@ import type {
   AnchorType,
   Annotation,
   AnnotationKind,
+  AnnotationPackage,
   Chapter,
   Sentence,
   TextDocument,
@@ -252,8 +253,98 @@ export const initialDocument: TextDocument = {
   chapters,
   annotations,
   snapshots: [initialSnapshot],
+  importedPackages: [],
   updatedAt: FIXED_TIME
 };
+
+/** 模拟整理组带回的离线批注包，供导入面板一键载入演示。 */
+export const samplePackages: AnnotationPackage[] = [
+  {
+    packageId: 'pkg-suzhou-2026-10a',
+    label: '苏批回流·十月甲包',
+    source: '苏州整理组',
+    exportedAt: '2026-10-02T09:30:00.000Z',
+    annotations: [
+      {
+        id: 'annotation-1',
+        anchorId: 'sentence-1-1',
+        anchorType: 'sentence',
+        kind: 'footnote',
+        title: '北冥（苏校修订）',
+        body: '冥，读为溟，训海。北溟即北方广漠之海，与南冥对文，不宜泥指地名。',
+        source: '郭庆藩本',
+        references: ['annotation-2'],
+        tags: ['地理', '通假', '苏校']
+      },
+      {
+        id: 'annotation-2',
+        anchorId: 'sentence-1-1',
+        anchorType: 'sentence',
+        kind: 'footnote',
+        title: '北冥（王本直训）',
+        body: '王先谦径训“冥”为海，语意直截；苏批以为与对文之说可并存，存以备考。',
+        source: '王先谦本',
+        references: ['annotation-1'],
+        tags: ['地理', '苏校']
+      },
+      {
+        anchorId: 'sentence-1-3',
+        anchorType: 'sentence',
+        kind: 'background',
+        title: '鹏徙南冥的时节',
+        body: '“海运”之“运”旧有二训：一为海动风起，一为运行迁徙。甲包取海气动则大风作之说。',
+        source: '苏批汇辑',
+        tags: ['义理']
+      },
+      {
+        anchorId: 'sentence-3-1',
+        anchorType: 'sentence',
+        kind: 'crossref',
+        title: '秋水时至与《逍遥游》对举',
+        body: '“秋水时至”承“海运将徙”而来，一写积风，一写积水，可与《逍遥游》互参。',
+        source: '结构注',
+        references: ['sentence-1-5'],
+        tags: ['互见']
+      }
+    ]
+  },
+  {
+    packageId: 'pkg-overseas-2026-09b',
+    label: '海外馆藏校读包',
+    source: '海外馆藏协校',
+    exportedAt: '2026-09-28T15:10:00.000Z',
+    annotations: [
+      {
+        id: 'annotation-7',
+        anchorId: 'sentence-2-4',
+        anchorType: 'sentence',
+        kind: 'variant',
+        title: '鷇音（馆藏覆案）',
+        body: '馆藏批校欲改“鷇”为“㝅”，并主张定为鸟鸣而非雏声；此说与已结案校记相左。',
+        source: '成玄英疏',
+        tags: ['异文', '覆案']
+      },
+      {
+        anchorId: 'sentence-3-5',
+        anchorType: 'sentence',
+        kind: 'background',
+        title: '望洋的连绵词性质',
+        body: '“望洋”亦作“望羊”“盳洋”，为仰视貌之连绵词，不当拆字解为望着海洋。',
+        source: '馆藏批校',
+        tags: ['训诂', '连绵词']
+      },
+      {
+        id: 'annotation-6',
+        anchorId: 'sentence-2-3',
+        anchorType: 'sentence',
+        kind: 'background',
+        title: '连续设问',
+        body: '三句设问并非要求事实答案，而是动摇“言必有定指”的预设。',
+        source: '讲义稿'
+      }
+    ]
+  }
+];
 
 export const annotationKindLabels: Record<AnnotationKind, string> = {
   footnote: '脚注',
