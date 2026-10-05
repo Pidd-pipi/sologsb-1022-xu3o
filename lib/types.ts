@@ -37,6 +37,13 @@ export interface Annotation {
   conflictState: 'open' | 'resolved';
   conflictResolution?: string;
   updatedAt: string;
+  /** 引用目标是否已失效（句子正文修订后，原词级引用迁移到所属句并标记失效）。 */
+  invalid?: boolean;
+  invalidReason?: string;
+  /** 跨离线包导入时的稳定身份：`${packageId}:${annotationId}`，用于幂等同一条目。 */
+  originId?: string;
+  /** 该条目由哪个离线批注包导入，用于按来源列出与追溯。 */
+  importedFrom?: { packageId: string; label: string };
 }
 
 export interface VersionSnapshot {
@@ -48,6 +55,25 @@ export interface VersionSnapshot {
   annotations: Annotation[];
 }
 
+/** 离线批注包：整理组离线批注后带回合并的一批注释。 */
+export interface AnnotationPackage {
+  /** 包的稳定身份；重复导入同一 packageId 不新增记录。 */
+  packageId: string;
+  label: string;
+  exportedAt: string;
+  note?: string;
+  /** 导出时的句子正文快照，用于检测句子正文是否被本地修订。 */
+  sentences?: { id: string; text: string }[];
+  annotations: Annotation[];
+}
+
+export interface PackageImportRecord {
+  packageId: string;
+  label: string;
+  importedAt: string;
+  annotationCount: number;
+}
+
 export interface TextDocument {
   id: string;
   title: string;
@@ -56,6 +82,7 @@ export interface TextDocument {
   chapters: Chapter[];
   annotations: Annotation[];
   snapshots: VersionSnapshot[];
+  importedPackages: PackageImportRecord[];
   updatedAt: string;
 }
 

@@ -25,10 +25,12 @@ import {
   CircleHelp,
   FileDown,
   FileJson,
+  FileUp,
   GitCompareArrows,
   Keyboard,
   Link2,
   ListTree,
+  Package,
   Pencil,
   Plus,
   Printer,
@@ -38,7 +40,8 @@ import {
   Trash2,
   Undo2,
   Wifi,
-  WifiOff
+  WifiOff,
+  XCircle
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { annotationKindLabels, anchorTypeLabels, initialDocument, tokenizeText } from '@/lib/data';
@@ -55,6 +58,7 @@ import {
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import { buildPackageFromDocument, mergePackage, type PackageMergeReport } from '@/lib/merge';
 import type {
   Annotation,
   AnnotationKind,
@@ -278,13 +282,23 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
                 <Chip size="sm" color={kindColors[annotation.kind]} variant="flat">
                   {kindLabel(annotation.kind)}
                 </Chip>
-                {annotation.conflictState === 'open' ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
+                {annotation.invalid ? <Chip size="sm" color="warning" variant="bordered">已失效</Chip> : null}
+                {annotation.conflictState === 'open' && !annotation.invalid ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
+                {annotation.importedFrom ? (
+                  <Chip size="sm" variant="flat" color="secondary">来自 {annotation.importedFrom.label}</Chip>
+                ) : null}
               </div>
               <h4 className="mt-2 font-semibold text-stone-900">{annotation.title}</h4>
             </div>
             <span className="whitespace-nowrap text-xs text-stone-500">{annotation.source}</span>
           </div>
           {!editing ? <p className="mt-2 text-sm leading-6 text-stone-700">{annotation.body}</p> : null}
+          {!editing && annotation.invalid ? (
+            <p className="mt-2 flex items-center gap-1 text-xs text-amber-700">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              {annotation.invalidReason ?? '引用目标已失效'}
+            </p>
+          ) : null}
         </button>
 
         {editing ? (
@@ -340,7 +354,11 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [packageText, setPackageText] = useState('');
+  const [importReport, setImportReport] = useState<PackageMergeReport | null>(null);
+  const [failedPackage, setFailedPackage] = useState<{ text: string; error: string } | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
   const document = workspace.document;
@@ -356,6 +374,7 @@ export function TextAnnotationWorkbench() {
     preview: selectedSentence?.text ?? selectedChapter?.title ?? ''
   };
   const anchorAnnotations = document.annotations.filter((annotation) => annotation.anchorId === anchor.id);
+  const invalidAnnotations = useMemo(() => document.annotations.filter((annotation) => annotation.invalid), [document.annotations]);
   const selectedAnnotation = document.annotations.find((item) => item.id === workspace.selectedAnnotationId) ?? null;
 
   useEffect(() => {
@@ -622,6 +641,162 @@ export function TextAnnotationWorkbench() {
 
   function exportHtml() {
     download(`${document.title}.html`, buildHtml(document), 'text/html;charset=utf-8');
+  }
+
+  function exportPackage() {
+    const pkg = buildPackageFromDocument(document);
+    download(`${pkg.label}.json`, JSON.stringify(pkg, null, 2), 'application/json;charset=utf-8');
+    setApiMessage('已导出当前离线批注包，可离线批注后带回合并。');
+  }
+
+  function applyImport(raw: unknown, sourceText: string) {
+    // 先在副本上校验并试合并，失败则不触碰当前草稿，整批保留供重试。
+    const probe = clone(document);
+    const report = mergePackage(probe, raw);
+    if (!report.ok) {
+      setFailedPackage({ text: sourceText, error: report.error ?? '批注包校验失败。' });
+      setImportReport(report);
+      setApiMessage(`批注包导入失败：${report.error}。整批已保留，可修正后重试。`);
+      return;
+    }
+    dispatch({
+      type: 'commit',
+      label: `导入批注包：${report.label}`,
+      mutate: (doc) => {
+        mergePackage(doc, raw);
+      }
+    });
+    setFailedPackage(null);
+    setPackageText('');
+    setImportReport(report);
+    setApiMessage(
+      `批注包「${report.label}」合并完成：新增 ${report.added}，更新 ${report.updated}，保留已解决 ${report.preserved}，失效 ${report.invalidated}。`
+    );
+  }
+
+  function handlePackageTextImport() {
+    const text = failedPackage?.text ?? packageText;
+    if (!text.trim()) {
+      setFailedPackage({ text: '', error: '请先粘贴批注包 JSON 或选择文件。' });
+      return;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      setFailedPackage({ text, error: 'JSON 解析失败：内容不是有效的 JSON。' });
+      return;
+    }
+    applyImport(raw, text);
+  }
+
+  function handlePackageFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result ?? '');
+      let raw: unknown;
+      try {
+        raw = JSON.parse(text);
+      } catch {
+        setFailedPackage({ text, error: 'JSON 解析失败：文件不是有效的 JSON。' });
+        return;
+      }
+      applyImport(raw, text);
+    };
+    reader.readAsText(file);
+  }
+
+  function buildSamplePackage(): string {
+    const pengToken = document.chapters[0]?.sentences[2]?.tokens.find((token) => token.text.includes('鹏'));
+    const now = new Date().toISOString();
+    const annotations: Annotation[] = [
+      {
+        id: 'pkg-sample-1',
+        anchorId: 'sentence-1-1',
+        anchorType: 'sentence',
+        kind: 'footnote',
+        title: '北冥（校勘组）',
+        body: '冥者，北方之水名也。旧注以为海，非是。',
+        source: '校勘组',
+        references: [],
+        status: 'open',
+        tags: ['地理'],
+        conflictState: 'open',
+        updatedAt: now
+      },
+      {
+        id: 'pkg-sample-2',
+        anchorId: 'sentence-2-3',
+        anchorType: 'sentence',
+        kind: 'variant',
+        title: '鷇音（校勘组）',
+        body: '鷇音，雏鸣。旧注云鸟鸣，义得两通。',
+        source: '成玄英疏',
+        references: [],
+        status: 'open',
+        tags: ['异文'],
+        conflictState: 'open',
+        updatedAt: now
+      },
+      ...(pengToken
+        ? [
+            {
+              id: 'pkg-sample-3',
+              anchorId: pengToken.id,
+              anchorType: 'word' as AnchorType,
+              kind: 'variant' as AnnotationKind,
+              title: '鹏（敦煌本）',
+              body: '敦煌本作“朋”，隶书之变也。',
+              source: '敦煌本',
+              references: [],
+              status: 'open' as const,
+              tags: ['字形'],
+              conflictState: 'open' as const,
+              updatedAt: now
+            }
+          ]
+        : []),
+      {
+        id: 'pkg-sample-4',
+        anchorId: 'sentence-3-1',
+        anchorType: 'sentence',
+        kind: 'footnote',
+        title: '秋水时至',
+        body: '秋水，夏历之水。时至，谓以时而至。',
+        source: '校勘组',
+        references: [],
+        status: 'open',
+        tags: ['训诂'],
+        conflictState: 'open',
+        updatedAt: now
+      },
+      {
+        id: 'pkg-sample-5',
+        anchorId: 'sentence-1-1-token-0',
+        anchorType: 'word',
+        kind: 'variant',
+        title: '北冥异文（失效）',
+        body: '一本“冥”作“溟”。',
+        source: '校勘组',
+        references: [],
+        status: 'open',
+        tags: ['异文'],
+        conflictState: 'open',
+        updatedAt: now
+      }
+    ];
+    return JSON.stringify(
+      {
+        packageId: 'pkg-sample-校勘组',
+        label: '校勘组离线批注包（示例）',
+        exportedAt: now,
+        note: '演示用：不同来源的重复注释、已解决取舍保留与一条失效引用。',
+        sentences: [{ id: 'sentence-1-1', text: '北冥有鱼，其名为鲲。（校勘组录一本异文）' }],
+        annotations
+      },
+      null,
+      2
+    );
   }
 
   const mode = workspace.mode;
@@ -964,6 +1139,32 @@ export function TextAnnotationWorkbench() {
                           onDelete={() => deleteAnnotation(annotation.id)}
                         />
                       )) : <p className="rounded-lg border border-dashed border-stone-300 p-4 text-center text-xs text-stone-500">尚未添加注释。选择词语可缩小注释范围。</p>}
+
+                      {invalidAnnotations.length ? (
+                        <>
+                          <Divider />
+                          <div className="flex items-center justify-between">
+                            <h3 className="flex items-center gap-2 font-semibold text-stone-900">
+                              <AlertTriangle className="h-4 w-4 text-amber-600" />失效批注
+                            </h3>
+                            <Chip size="sm" color="warning" variant="flat">{invalidAnnotations.length} 条</Chip>
+                          </div>
+                          <div className="rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-800">
+                            句子正文修订后，原词级引用已迁移到所属句并标记失效。可重新锚定到当前句子，或删除后重新添加。
+                          </div>
+                          {invalidAnnotations.map((annotation) => (
+                            <AnnotationCard
+                              key={annotation.id}
+                              annotation={annotation}
+                              document={document}
+                              selected={selectedAnnotation?.id === annotation.id}
+                              onSelect={() => dispatch({ type: 'selectAnnotation', annotationId: annotation.id })}
+                              onUpdate={(patch) => updateAnnotation(annotation.id, patch)}
+                              onDelete={() => deleteAnnotation(annotation.id)}
+                            />
+                          ))}
+                        </>
+                      ) : null}
                     </div>
                   </ScrollShadow>
                 </Tab>
@@ -1078,6 +1279,112 @@ export function TextAnnotationWorkbench() {
                         <Button size="sm" variant="flat" onPress={exportHtml} startContent={<FileDown className="h-4 w-4" />}>导出 HTML</Button>
                         <Button size="sm" variant="flat" onPress={exportJson} startContent={<FileJson className="h-4 w-4" />}>导出 JSON</Button>
                       </div>
+                      <p className="text-[11px] leading-5 text-stone-500">{apiMessage}</p>
+                    </div>
+                  </ScrollShadow>
+                </Tab>
+
+                <Tab key="packages" title="批注包">
+                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                    <div className="space-y-4 pr-1">
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="flex items-center gap-2 font-semibold text-stone-900"><Package className="h-4 w-4" />离线批注包</h3>
+                        <p className="mt-2 text-xs leading-5 text-stone-500">
+                          导入整理组带回的批注包，按「锚点 + 注释类型 + 来源」合并。本地已解决的校记与交叉引用不会被覆盖；同一条目再次导入不新增记录。
+                        </p>
+                        <div className="mt-3 grid grid-cols-2 gap-2">
+                          <Button size="sm" color="primary" variant="flat" startContent={<FileUp className="h-4 w-4" />} onPress={() => fileInputRef.current?.click()}>
+                            导入批注包
+                          </Button>
+                          <Button size="sm" variant="flat" startContent={<FileDown className="h-4 w-4" />} onPress={exportPackage}>
+                            导出当前包
+                          </Button>
+                        </div>
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept="application/json,.json"
+                          className="hidden"
+                          onChange={(event) => {
+                            const file = event.target.files?.[0];
+                            if (file) handlePackageFile(file);
+                            event.target.value = '';
+                          }}
+                        />
+                        <Button
+                          className="mt-2 w-full"
+                          size="sm"
+                          variant="light"
+                          onPress={() => {
+                            setPackageText(buildSamplePackage());
+                            setFailedPackage(null);
+                          }}
+                        >
+                          填入示例批注包
+                        </Button>
+                      </div>
+
+                      <div className="rounded-xl border border-stone-200 p-3">
+                        <h3 className="text-xs font-semibold uppercase tracking-wider text-stone-500">粘贴批注包 JSON</h3>
+                        <Textarea
+                          className="mt-2"
+                          aria-label="批注包 JSON"
+                          value={failedPackage?.text ?? packageText}
+                          onValueChange={(value) => {
+                            if (failedPackage) setFailedPackage({ ...failedPackage, text: value });
+                            else setPackageText(value);
+                          }}
+                          minRows={6}
+                          placeholder='{"packageId":"...","label":"...","annotations":[...]}'
+                        />
+                        {failedPackage ? (
+                          <p className="mt-2 flex items-start gap-1 text-xs text-red-600">
+                            <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                            <span>{failedPackage.error} 整批已保留，修正后可重试。</span>
+                          </p>
+                        ) : null}
+                        <Button className="mt-2 w-full" size="sm" color="primary" onPress={handlePackageTextImport}>
+                          {failedPackage ? '重试导入' : '合并批注包'}
+                        </Button>
+                      </div>
+
+                      {importReport ? (
+                        <div className={`rounded-xl border p-3 text-xs leading-5 ${importReport.ok ? 'border-green-200 bg-green-50 text-green-800' : 'border-red-200 bg-red-50 text-red-800'}`}>
+                          <div className="flex items-center gap-2 font-semibold">
+                            {importReport.ok ? <Check className="h-4 w-4" /> : <XCircle className="h-4 w-4" />}
+                            <span>{importReport.ok ? `已合并「${importReport.label}」` : '导入失败'}</span>
+                          </div>
+                          {importReport.ok ? (
+                            <ul className="mt-2 list-inside list-disc space-y-1">
+                              <li>新增 {importReport.added} 条</li>
+                              <li>更新 {importReport.updated} 条</li>
+                              <li>保留本地已解决 {importReport.preserved} 条</li>
+                              <li>内容未变 {importReport.unchanged} 条</li>
+                              {importReport.invalidated ? <li className="text-amber-700">引用失效 {importReport.invalidated} 条（已标记，可在注释面板处理）</li> : null}
+                              {importReport.alreadyImported ? <li className="text-stone-500">该包已导入过，未新增记录。</li> : null}
+                            </ul>
+                          ) : null}
+                        </div>
+                      ) : null}
+
+                      <div className="rounded-xl border border-stone-200">
+                        <div className="border-b border-stone-100 px-3 py-2 text-xs font-semibold text-stone-700">已导入批注包</div>
+                        {document.importedPackages.length ? (
+                          <ul className="divide-y divide-stone-100">
+                            {document.importedPackages.map((record) => (
+                              <li key={record.packageId} className="px-3 py-2 text-xs">
+                                <div className="font-medium text-stone-800">{record.label}</div>
+                                <div className="mt-0.5 text-stone-500">
+                                  {record.annotationCount} 条 · 导入于 {new Date(record.importedAt).toLocaleString('zh-CN')}
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="px-3 py-4 text-center text-xs text-stone-500">尚未导入离线批注包。</p>
+                        )}
+                      </div>
+
                       <p className="text-[11px] leading-5 text-stone-500">{apiMessage}</p>
                     </div>
                   </ScrollShadow>

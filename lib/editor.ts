@@ -218,7 +218,7 @@ function findChapterIdForAnnotation(document: TextDocument, annotation: Annotati
 export function getConflictGroups(document: TextDocument): ConflictGroup[] {
   const groups = new Map<string, Annotation[]>();
   for (const annotation of document.annotations) {
-    if (annotation.conflictState === 'resolved') continue;
+    if (annotation.conflictState === 'resolved' || annotation.invalid) continue;
     const key = `${annotation.anchorId}:${annotation.kind}`;
     groups.set(key, [...(groups.get(key) ?? []), annotation]);
   }
@@ -282,6 +282,8 @@ export function updateSentenceText(
         annotation.anchorId = sentence.id;
         annotation.anchorType = 'sentence';
         annotation.title = `${annotation.title}（引用已随修订迁移）`;
+        annotation.invalid = true;
+        annotation.invalidReason = '句子正文已修订，原词语引用失效，已迁移到所属句';
         remappedAnnotations += 1;
       }
     }
